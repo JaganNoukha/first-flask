@@ -29,4 +29,4 @@ jobs:
 
     - name: Display Flask version (optional)
       run: |
-        pip show Flask # Show information about the installed Flask package
+        pip show Flask
