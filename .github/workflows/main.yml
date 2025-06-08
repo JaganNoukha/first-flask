@@ -1,5 +1,5 @@
 # .github/workflows/build-and-deploy-flask-app.yml
-name: Build and Deploy Flask App to EC2 (Corrected)
+name: Build and Deploy Flask App to EC2 (Most Robust)
 
 on:
   push:
@@ -13,10 +13,6 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4 # This step gets your code from the GitHub repository onto the runner
-
-    # Removed the 'Install dependencies (on GitHub Actions Runner)' step here.
-    # While it's useful for running tests or linting on the runner, it's not strictly
-    # necessary for the deployment itself, as dependencies are installed on EC2.
 
     - name: Transfer app files to EC2
       uses: appleboy/scp-action@v0.1.6 # Use SCP action to securely copy files from runner to EC2
@@ -42,43 +38,103 @@ jobs:
         username: ${{ secrets.EC2_USERNAME }}
         key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
         script: |
-          # Define the target directory on your EC2 instance
-          # This must match the 'target' from the scp-action
+          # --- Environment Setup and Path Verification ---
           TARGET_DIR="/home/${{ secrets.EC2_USERNAME }}/first-flask"
+          VENV_DIR="$TARGET_DIR/venv"
+          PYTHON_BIN="$VENV_DIR/bin/python3"
+          PIP_BIN="$VENV_DIR/bin/pip"
+          GUNICORN_BIN="$VENV_DIR/bin/gunicorn"
 
-          # Create the target directory if it doesn't exist (scp-action might have already done this)
-          echo "Ensuring target directory exists: $TARGET_DIR"
+          echo "Deployment target directory: $TARGET_DIR"
+          echo "Virtual environment directory: $VENV_DIR"
+
+          # Ensure the target directory exists and its permissions are correct
+          echo "Ensuring target directory exists and has correct permissions..."
           mkdir -p "$TARGET_DIR"
+          chmod -R 755 "$TARGET_DIR" # Ensure files are executable/readable by owner, readable by others
 
-          # Change to the application directory on EC2, where files were just copied
+          # Change to the application directory on EC2, where files were just copied by scp-action
           echo "Changing to application directory: $TARGET_DIR"
-          cd "$TARGET_DIR"
+          cd "$TARGET_DIR" || { echo "ERROR: Could not change to $TARGET_DIR. Exiting."; exit 1; }
 
-          # --- Virtual Environment Setup on EC2 ---
-          # Create virtual environment if it doesn't exist within the deployed app directory
-          if [ ! -d "venv" ]; then
-            echo "Creating virtual environment..."
-            python3 -m venv venv
+          # Verify files are present after SCP transfer
+          echo "Listing contents of $TARGET_DIR to verify files:"
+          ls -la "$TARGET_DIR"
+
+          # Verify requirements.txt specifically
+          if [ -f "requirements.txt" ]; then
+            echo "requirements.txt found!"
+          else
+            echo "ERROR: requirements.txt NOT FOUND in $TARGET_DIR. Deployment cannot proceed."
+            exit 1
           fi
 
-          # Activate the virtual environment
-          echo "Activating virtual environment..."
-          source venv/bin/activate
+          # --- Virtual Environment Setup on EC2 ---
+          # Create virtual environment if it doesn't exist
+          if [ ! -d "$VENV_DIR" ]; then
+            echo "Creating virtual environment at $VENV_DIR..."
+            python3 -m venv "$VENV_DIR" || { echo "ERROR: Failed to create virtual environment. Exiting."; exit 1; }
+          else
+            echo "Virtual environment already exists at $VENV_DIR."
+          fi
 
-          # Install any new or updated Python dependencies (critical after file transfer)
-          echo "Installing/updating Python dependencies on EC2..."
-          pip install -r requirements.txt
+          # Verify python and pip executables exist in venv
+          if [ ! -f "$PYTHON_BIN" ]; then
+              echo "ERROR: Python executable not found in venv: $PYTHON_BIN. Exiting."
+              exit 1
+          fi
+          if [ ! -f "$PIP_BIN" ]; then
+              echo "ERROR: Pip executable not found in venv: $PIP_BIN. Exiting."
+              exit 1
+          fi
+
+          # Activate the virtual environment explicitly for the current shell session
+          echo "Activating virtual environment..."
+          # Note: 'source' only affects the current shell. For direct execution, use full path.
+          # We'll use full paths for pip and gunicorn for robustness.
+
+          # Install any new or updated Python dependencies
+          echo "Installing/updating Python dependencies using $PIP_BIN..."
+          "$PIP_BIN" install --upgrade pip setuptools wheel
+          "$PIP_BIN" install -r requirements.txt || { echo "ERROR: Failed to install Python dependencies. Exiting."; exit 1; }
+
+          # Verify Gunicorn installation
+          if ! "$GUNICORN_BIN" --version &> /dev/null; then
+            echo "ERROR: Gunicorn not found in venv. Make sure it's in requirements.txt. Exiting."
+            exit 1
+          else
+            echo "Gunicorn found: $("$GUNICORN_BIN" --version)"
+          fi
 
           # --- Production WSGI Server (Gunicorn) ---
-          # Stop any existing Gunicorn process running this app
-          echo "Stopping existing Gunicorn Flask app (if running)..."
-          pkill -f 'gunicorn' || true # Use '|| true' to prevent script failure if no process is found
+          # Stop any existing Gunicorn process running this app on port 5000
+          echo "Stopping existing Gunicorn Flask app on port 5000 (if running)..."
+          # More precise kill: find processes listening on port 5000 and kill their parent gunicorn process
+          # This handles cases where pkill -f 'gunicorn' might be too broad or too narrow.
+          sudo lsof -t -i :5000 | xargs -r kill || true
+          # Give a moment for the port to clear
+          sleep 2
 
           # Start the Flask app using Gunicorn in the background
           # Assumes your Flask application instance is named 'app' in 'app.py' (app:app)
           # Binds to all interfaces (0.0.0.0) on port 5000.
-          echo "Starting new Flask app with Gunicorn..."
-          # Use the python interpreter from the active virtual environment
-          nohup gunicorn --workers 4 --bind 0.0.0.0:5000 app:app > app.log 2>&1 &
+          echo "Starting new Flask app with Gunicorn using $GUNICORN_BIN..."
+          nohup "$GUNICORN_BIN" --workers 4 --bind 0.0.0.0:5000 app:app > app.log 2>&1 &
+          GUNICORN_PID=$! # Get the PID of the last background command
 
-          echo "Deployment complete! Check your EC2 public IP on port 5000."
+          echo "Gunicorn started with PID: $GUNICORN_PID"
+          echo "Giving Gunicorn a moment to start..."
+          sleep 5 # Give Gunicorn some time to fully initialize
+
+          # --- Self-check on EC2 ---
+          echo "Attempting to curl the application locally on EC2 (http://127.0.0.1:5000)..."
+          CURL_OUTPUT=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5000/)
+          if [ "$CURL_OUTPUT" -eq 200 ]; then
+            echo "Local self-check: Application responded with HTTP 200 OK."
+            echo "Deployment complete! Your Flask app should now be running on port 5000."
+            echo "Access it via your EC2 public IP address: http://${{ secrets.EC2_HOST }}:5000"
+          else
+            echo "WARNING: Local self-check failed. Application responded with HTTP $CURL_OUTPUT. Check app.log for errors."
+            echo "Deployment might have issues. Check logs on EC2: tail -f app.log"
+            exit 1 # Fail the GitHub Action if the app doesn't respond locally
+          fi
