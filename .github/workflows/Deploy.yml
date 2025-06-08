@@ -1,5 +1,5 @@
 # .github/workflows/build-and-deploy-flask-app.yml
-name: Build and Deploy Flask App to EC2 (Most Robust)
+name: Build and Deploy Flask App to EC2 (Final Attempt)
 
 on:
   push:
@@ -14,22 +14,17 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4 # This step gets your code from the GitHub repository onto the runner
 
-    - name: Transfer app files to EC2
+    - name: Transfer app files to EC2 (initial transfer to staging)
+      # This step copies all necessary files to a temporary location on EC2.
+      # Exclusions and deletions will be handled by rsync in the next step.
       uses: appleboy/scp-action@v0.1.6 # Use SCP action to securely copy files from runner to EC2
       with:
         host: ${{ secrets.EC2_HOST }}
         username: ${{ secrets.EC2_USERNAME }}
         key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-        # Source path on the GitHub Actions runner.
-        # '.' refers to the root of your checked-out repository.
-        source: "./"
-        # Destination path on your EC2 instance.
-        # Make sure this matches where your app should reside.
-        target: "/home/${{ secrets.EC2_USERNAME }}/first-flask"
-        # Exclude directories/files that shouldn't be copied to EC2
-        exclude: ".git,venv,.github" # Excludes Git data, local virtual environment, and GitHub Actions workflow files
-        overwrite: true # Overwrite existing files on the destination
-        rm: true # Remove files at destination that are not in the source (equivalent to rsync's --delete)
+        source: "./" # Refers to the root of your checked-out repository on the GitHub Actions runner
+        target: "/tmp/flask-app-staging" # Temporary staging directory on EC2
+        overwrite: true # Overwrite existing files in the staging area
 
     - name: Set up Python on EC2 and Deploy
       uses: appleboy/ssh-action@v0.1.10 # Now use SSH action to execute commands on EC2
@@ -39,25 +34,45 @@ jobs:
         key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
         script: |
           # --- Environment Setup and Path Verification ---
-          TARGET_DIR="/home/${{ secrets.EC2_USERNAME }}/first-flask"
+          STAGING_DIR="/tmp/flask-app-staging" # Temporary directory where files were copied by scp-action
+          TARGET_DIR="/home/${{ secrets.EC2_USERNAME }}/first-flask" # Final deployment directory
           VENV_DIR="$TARGET_DIR/venv"
           PYTHON_BIN="$VENV_DIR/bin/python3"
           PIP_BIN="$VENV_DIR/bin/pip"
           GUNICORN_BIN="$VENV_DIR/bin/gunicorn"
 
+          echo "Staging directory on EC2: $STAGING_DIR"
           echo "Deployment target directory: $TARGET_DIR"
           echo "Virtual environment directory: $VENV_DIR"
 
-          # Ensure the target directory exists and its permissions are correct
+          # Ensure the target deployment directory exists and its permissions are correct
           echo "Ensuring target directory exists and has correct permissions..."
           mkdir -p "$TARGET_DIR"
           chmod -R 755 "$TARGET_DIR" # Ensure files are executable/readable by owner, readable by others
 
-          # Change to the application directory on EC2, where files were just copied by scp-action
+          # Synchronize files from the staging directory to the final target directory on EC2
+          # Use rsync for efficient syncing, including exclusions and deletions
+          echo "Synchronizing application files from staging to target with rsync..."
+          # -a: archive mode (preserves permissions, timestamps, etc.)
+          # -v: verbose
+          # -z: compress file data during transfer (useful for slow links)
+          # --delete: deletes extraneous files from dest dir (files not in source dir)
+          # --exclude: specify patterns to exclude
+          rsync -avz --delete \
+            --exclude '.git/' \
+            --exclude 'venv/' \
+            --exclude '.github/' \
+            "$STAGING_DIR"/ "$TARGET_DIR"/ || { echo "ERROR: rsync failed to synchronize files. Exiting."; exit 1; }
+
+          # Clean up the staging directory
+          echo "Cleaning up staging directory: $STAGING_DIR"
+          rm -rf "$STAGING_DIR"
+
+          # Change to the application directory on EC2, where files were just synchronized
           echo "Changing to application directory: $TARGET_DIR"
           cd "$TARGET_DIR" || { echo "ERROR: Could not change to $TARGET_DIR. Exiting."; exit 1; }
 
-          # Verify files are present after SCP transfer
+          # Verify files are present after rsync transfer
           echo "Listing contents of $TARGET_DIR to verify files:"
           ls -la "$TARGET_DIR"
 
@@ -88,11 +103,6 @@ jobs:
               exit 1
           fi
 
-          # Activate the virtual environment explicitly for the current shell session
-          echo "Activating virtual environment..."
-          # Note: 'source' only affects the current shell. For direct execution, use full path.
-          # We'll use full paths for pip and gunicorn for robustness.
-
           # Install any new or updated Python dependencies
           echo "Installing/updating Python dependencies using $PIP_BIN..."
           "$PIP_BIN" install --upgrade pip setuptools wheel
@@ -110,7 +120,9 @@ jobs:
           # Stop any existing Gunicorn process running this app on port 5000
           echo "Stopping existing Gunicorn Flask app on port 5000 (if running)..."
           # More precise kill: find processes listening on port 5000 and kill their parent gunicorn process
-          # This handles cases where pkill -f 'gunicorn' might be too broad or too narrow.
+          # 'sudo lsof' might require a password prompt if SSH user is not in sudoers with NOPASSWD.
+          # If this causes issues, you might need to manually ensure `lsof` is installed and the user
+          # has permissions or fall back to a simpler `pkill -f 'gunicorn'`.
           sudo lsof -t -i :5000 | xargs -r kill || true
           # Give a moment for the port to clear
           sleep 2
@@ -128,6 +140,7 @@ jobs:
 
           # --- Self-check on EC2 ---
           echo "Attempting to curl the application locally on EC2 (http://127.0.0.1:5000)..."
+          # Ensure curl is installed: sudo apt-get update && sudo apt-get install -y curl
           CURL_OUTPUT=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5000/)
           if [ "$CURL_OUTPUT" -eq 200 ]; then
             echo "Local self-check: Application responded with HTTP 200 OK."
@@ -136,5 +149,7 @@ jobs:
           else
             echo "WARNING: Local self-check failed. Application responded with HTTP $CURL_OUTPUT. Check app.log for errors."
             echo "Deployment might have issues. Check logs on EC2: tail -f app.log"
+            # It's okay to exit 0 here if you consider a local curl warning acceptable,
+            # but exiting 1 makes the GitHub Action fail visibly.
             exit 1 # Fail the GitHub Action if the app doesn't respond locally
           fi
