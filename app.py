@@ -6,4 +6,8 @@ app = Flask(__name__)
 def home_page():
     return "Hello Gopi"
 
+@app.route('/Jagan') # This defines the route for the root URL
+def home_page():
+    return "Hello Jagan"
+
 # ... other routes you might have ...
